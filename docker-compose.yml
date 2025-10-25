@@ -1,0 +1,19 @@
+version: "3.8"
+
+services:
+  dwg-extractor:
+    build: .
+    container_name: dwg-extractor
+    ports:
+      - "8083:8083"
+    restart: unless-stopped
+    environment:
+      - PYTHONUNBUFFERED=1
+    volumes:
+      - /tmp:/tmp # Si querés compartir el /tmp con el host
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8083/health"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
