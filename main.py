@@ -1,12 +1,12 @@
-from fastapi import FastAPI, File, UploadFile, HTTPException, Request
+from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import ezdxf
-from ezdxf import DXFStructureError
 import tempfile
 import os
-from typing import Optional
+import subprocess
 import logging
-import magic  # pip install python-magic
+from typing import Optional
+import shutil
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -21,78 +21,167 @@ app.add_middleware(
 )
 
 
-@app.get("/health")
-async def health_check():
-    return {"status": "ok", "service": "dwg-extractor"}
-
-
-def detect_file_type(file_path: str) -> dict:
-    """Detecta el tipo de archivo y sus primeros bytes"""
+def detect_dwg_version(file_path: str) -> dict:
+    """Detecta la versión del archivo DWG/DXF"""
     with open(file_path, "rb") as f:
         header = f.read(100)
 
-    # Los archivos DXF empiezan con "0\r\nSECTION" o similar (texto)
-    # Los archivos DWG empiezan con "AC1" seguido de la versión
+    try:
+        text_header = header[:50].decode("ascii")
+        is_text = True
+        file_type = "DXF"
+    except:
+        is_text = False
+        file_type = "DWG"
 
-    is_text = all(b < 128 for b in header[:50] if b != 0)
+    dwg_version = "Unknown"
+    if header.startswith(b"AC"):
+        version_code = header[0:6].decode("ascii", errors="ignore")
+        dwg_versions = {
+            "AC1032": "AutoCAD 2018-2021",
+            "AC1027": "AutoCAD 2013-2017",
+            "AC1024": "AutoCAD 2010-2012",
+            "AC1021": "AutoCAD 2007-2009",
+            "AC1018": "AutoCAD 2004-2006",
+        }
+        dwg_version = dwg_versions.get(version_code, version_code)
 
     return {
-        "first_bytes": header[:50].hex(),
-        "first_chars": header[:50].decode("ascii", errors="ignore"),
-        "likely_type": "DXF" if is_text else "DWG",
-        "starts_with_ac": header.startswith(b"AC"),
+        "file_type": file_type,
+        "is_text": is_text,
+        "dwg_version": dwg_version,
+        "file_size": os.path.getsize(file_path),
+    }
+
+
+def convert_dwg_to_dxf(dwg_path: str) -> str:
+    """Convierte DWG a DXF usando ODA File Converter"""
+    logger.info(f"🔄 Converting DWG to DXF: {dwg_path}")
+
+    # Crear directorios temporales
+    input_dir = tempfile.mkdtemp(prefix="dwg_in_")
+    output_dir = tempfile.mkdtemp(prefix="dwg_out_")
+
+    try:
+        # Copiar archivo al directorio de entrada
+        input_file = os.path.join(input_dir, "input.dwg")
+        shutil.copy(dwg_path, input_file)
+
+        # Ejecutar ODA File Converter
+        # Sintaxis: ODAFileConverter input_folder output_folder output_version file_type recurse audit
+        cmd = [
+            "/usr/bin/ODAFileConverter",
+            input_dir,
+            output_dir,
+            "ACAD2018",  # Versión de salida
+            "DXF",  # Formato de salida
+            "0",  # No recursivo
+            "1",  # Audit
+        ]
+
+        logger.info(f"Running: {' '.join(cmd)}")
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+
+        if result.returncode != 0:
+            logger.error(f"ODA Converter error: {result.stderr}")
+            raise Exception(f"Conversion failed: {result.stderr}")
+
+        # Buscar el archivo DXF generado
+        dxf_files = [f for f in os.listdir(output_dir) if f.endswith(".dxf")]
+
+        if not dxf_files:
+            raise Exception("No DXF file generated")
+
+        dxf_path = os.path.join(output_dir, dxf_files[0])
+        logger.info(f"✅ DXF created: {dxf_path}")
+
+        return dxf_path
+
+    except subprocess.TimeoutExpired:
+        raise Exception("Conversion timeout (30s)")
+    except Exception as e:
+        raise Exception(f"Conversion error: {str(e)}")
+    finally:
+        # Limpiar directorio de entrada
+        try:
+            shutil.rmtree(input_dir)
+        except:
+            pass
+
+
+@app.get("/health")
+async def health_check():
+    # Verificar que ODA Converter esté instalado
+    oda_installed = os.path.exists("/usr/bin/ODAFileConverter")
+    return {
+        "status": "ok",
+        "service": "dwg-extractor",
+        "oda_converter": "installed" if oda_installed else "missing",
     }
 
 
 @app.post("/extract")
-async def extract_dwg(request: Request, file: Optional[UploadFile] = File(None)):
-    logger.info(f"Content-Type: {request.headers.get('content-type')}")
+async def extract_dwg(file: Optional[UploadFile] = File(None)):
+    logger.info(f"=== New Request ===")
 
     if not file:
-        body = await request.body()
-        logger.error(f"No file received. Body length: {len(body)}")
         raise HTTPException(400, "No se recibió ningún archivo")
 
-    logger.info(f"File received: {file.filename}, content_type: {file.content_type}")
+    logger.info(f"📄 File: {file.filename}")
 
-    if not file.filename:
-        raise HTTPException(400, "El archivo debe tener un nombre")
+    temp_dwg_path = None
+    temp_dxf_path = None
+    output_dir = None
 
-    temp_path = None
     try:
-        # Guardar archivo temporal
+        # Guardar archivo subido
         with tempfile.NamedTemporaryFile(delete=False, suffix=".dwg") as tmp:
             content = await file.read()
-            logger.info(f"Read {len(content)} bytes")
+            logger.info(f"✅ Read {len(content)} bytes")
 
             if len(content) == 0:
                 raise HTTPException(400, "El archivo está vacío")
 
             tmp.write(content)
-            temp_path = tmp.name
+            temp_dwg_path = tmp.name
 
-        # Detectar tipo de archivo
-        file_info = detect_file_type(temp_path)
-        logger.info(f"File info: {file_info}")
+        # Detectar tipo
+        file_info = detect_dwg_version(temp_dwg_path)
+        logger.info(f"📊 File info: {file_info}")
 
-        # Intentar leer con ezdxf
-        try:
-            # ezdxf puede leer algunos DWG directamente
-            doc = ezdxf.readfile(temp_path)
-        except IOError as e:
-            # Si falla, dar info útil
-            raise HTTPException(
-                422,
-                detail={
-                    "error": "No se pudo leer el archivo",
-                    "message": str(e),
-                    "file_info": file_info,
-                    "suggestion": "Convierte el archivo a DXF en AutoCAD o usa 'Guardar como' → DXF",
-                },
-            )
-        except DXFStructureError as e:
-            raise HTTPException(400, f"Archivo DXF corrupto: {str(e)}")
+        # Intentar leer directamente (si es DXF)
+        doc = None
+        if file_info["is_text"]:
+            logger.info("📖 File is DXF, reading directly...")
+            try:
+                doc = ezdxf.readfile(temp_dwg_path)
+                logger.info("✅ DXF read successful")
+            except Exception as e:
+                logger.warning(f"Failed to read DXF: {e}")
 
+        # Si es DWG o falló la lectura DXF, convertir
+        if doc is None:
+            logger.info("🔄 Converting DWG to DXF...")
+            try:
+                temp_dxf_path = convert_dwg_to_dxf(temp_dwg_path)
+                # Guardar referencia al output_dir para limpiarlo después
+                output_dir = os.path.dirname(temp_dxf_path)
+
+                doc = ezdxf.readfile(temp_dxf_path)
+                logger.info("✅ Converted DXF read successful")
+            except Exception as e:
+                logger.error(f"❌ Conversion failed: {e}")
+                raise HTTPException(
+                    422,
+                    detail={
+                        "error": "No se pudo convertir el archivo",
+                        "file_info": file_info,
+                        "message": str(e),
+                        "suggestion": "Convierte manualmente a DXF ASCII usando AutoCAD",
+                    },
+                )
+
+        # Extraer entidades
         msp = doc.modelspace()
         results = []
 
@@ -138,17 +227,19 @@ async def extract_dwg(request: Request, file: Optional[UploadFile] = File(None))
                     points = [list(v.dxf.location) for v in entity.vertices]
                     entity_data = {"points": points, "closed": entity.is_closed}
                 else:
-                    # Ignorar entidades no soportadas
                     continue
 
                 results.append({"kind": kind, "layer": layer, "data": entity_data})
             except Exception as e:
-                logger.warning(f"Error procesando entidad {kind}: {e}")
+                logger.warning(f"Error processing {kind}: {e}")
                 continue
+
+        logger.info(f"✅ Extracted {len(results)} entities")
 
         return {
             "file_name": file.filename,
-            "file_type": file_info.get("likely_type"),
+            "file_type": file_info["file_type"],
+            "dwg_version": file_info["dwg_version"],
             "count": len(results),
             "elements": results,
         }
@@ -156,12 +247,18 @@ async def extract_dwg(request: Request, file: Optional[UploadFile] = File(None))
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Unexpected error: {e}", exc_info=True)
+        logger.error(f"❌ Unexpected error: {e}", exc_info=True)
         raise HTTPException(500, f"Error interno: {str(e)}")
     finally:
-        if temp_path and os.path.exists(temp_path):
+        # Limpieza
+        if temp_dwg_path and os.path.exists(temp_dwg_path):
             try:
-                os.unlink(temp_path)
+                os.unlink(temp_dwg_path)
+            except:
+                pass
+        if output_dir and os.path.exists(output_dir):
+            try:
+                shutil.rmtree(output_dir)
             except:
                 pass
 
